@@ -1,0 +1,603 @@
+/// IDs used for getSharedObject() and addSharedObject()
+typedef enum {
+   shared_SensorQueueId,
+} sharedHandleId_t;
+
+/// Orientation type enumeration
+typedef enum {
+    invalid,
+    left,
+    right,
+	up,
+	down,
+} orientation_t;
+
+class orient_compute : public scheduler_task //task 1
+{
+    public:
+        orient_compute(uint8_t priority) : scheduler_task("compute", 2048, priority)
+        {
+            /* We save the queue handle by using addSharedObject() */
+            QueueHandle_t my_queue = xQueueCreate(1, sizeof(orientation_t));
+            addSharedObject(shared_SensorQueueId, my_queue);
+        }
+
+        bool run(void *p)
+        {
+            int x, y;
+            orientation_t orientation;
+            x = AS.getX();
+            y = AS.getY();
+            if (x > 400){
+            	orientation = left;
+            }
+            else if (x < -400){
+            	orientation = right;
+            }
+            else{
+            	if (y > 400){
+            		orientation = down;
+            	}
+            	else if (y < -400){
+            		orientation = up;
+            	}
+            	else{
+            		orientation = invalid;
+            	}
+            }
+            puts("Before send");
+            xQueueSend(getSharedObject(shared_SensorQueueId), &orientation, 1000);
+            puts("After send\n");
+            vTaskDelay(1000);
+            return true;
+        }
+};
+
+class orient_process : public scheduler_task //task 2
+{
+    public:
+        orient_process (uint8_t priority) : scheduler_task("process", 2048, priority)
+        {
+            /* Nothing to init */
+        }
+
+        bool run(void *p)
+        {
+            /* We first get the queue handle the other task added using addSharedObject() */
+            orientation_t orientation;
+            QueueHandle_t qid = getSharedObject(shared_SensorQueueId);
+
+            /* Sleep the task forever until an item is available in the queue */
+            if (xQueueReceive(qid, &orientation, 1000))
+            {
+            	puts("Data received");
+            	if (orientation == left){
+            		LE.setAll(0); //turn off LEDs specific to right
+            		LE.on(1);
+            		LE.on(2);
+            	}
+            	if (orientation == right){
+            		LE.setAll(0); //turn off LEDs specific to left
+            		LE.on(3);
+            		LE.on(4);
+            	}
+
+            	if (orientation == invalid || orientation == up || orientation == down){
+            		LE.setAll(0);
+            	}
+            }
+
+            return true;
+        }
+};
+
+class eint_task: public scheduler_task {
+public:
+	eint_task(uint8_t priority) : scheduler_task("eint", 2000, priority) {
+		//empty and stuff
+	}
+
+	bool run (void *p){
+
+		return true;
+	}
+
+	bool init(){//deals with rising edge
+
+		LPC_GPIOINT->IO0IntEnR |=(1<<0); //Enable rising edge interrupt for P0.0
+		LPC_GPIOINT->IO2IntEnR |=(1<<0); //Enable rising edge interrupt for P2.0
+		LPC_GPIO0->FIODIR &= ~(1<<0);
+		LPC_GPIO2->FIODIR &= ~(1<<0);
+		NVIC_EnableIRQ(EINT3_IRQn);//interrupt enable
+		isr_register(EINT3_IRQn, lab_interrupt);
+		return true;
+	}
+
+	static void lab_interrupt(void){
+		if((LPC_GPIOINT->IO0IntStatR) & (1<<0)){
+			u0_dbg_printf("interrupt received from P0.0\n");
+			LPC_GPIOINT->IO0IntClr = 0xFFFFFFFF;
+		}
+		if((LPC_GPIOINT->IO2IntStatR) & (1<<0)){
+			u0_dbg_printf("interrupt received from P2.0\n");
+			LPC_GPIOINT->IO2IntClr = 0xFFFFFFFF;
+		}
+		else{
+			//do nothing
+		}
+	}
+	/*
+	 * void port_2_enable_int (uint8_t pin, voic_funct_t uf){
+	 * LPC_GPIOINT->IO2IntEnR &=~(1<<pin);
+	 * LPC_GPIOINT->IO2IntEnR |=(1<<pin);
+	 * LPC_GPIO2->FIODIR &= ~(1<<pin);
+	 * }
+	 *
+	 * void port_0_enable_int (uint8_t pin, voic_funct_t uf){
+	 * LPC_GPIOINT->IO0IntEnR &=~(1<<pin);
+	 * LPC_GPIOINT->IO0IntEnR |=(1<<pin);
+	 * LPC_GPIO0->FIODIR &= ~(1<<pin);
+	 */
+};
+
+class uart_task: public scheduler_task {
+public:
+	uart_task(uint8_t priority) :
+			scheduler_task("uart", 2000, priority) {
+		//intentionally left empty
+	}
+
+	bool run (void *p){
+		//printf("starting task...\n");
+		char c;
+		init(38400);
+		printf("initialized uart driver\n");
+		while(1){
+		put_char('q');
+		printf("Sending letter q\n");
+		c = get_char();
+		printf("The received letter is %c\n\n", c);
+		vTaskDelay(1000);
+		}
+
+		return true;
+	}
+
+	bool init(const uint32_t baud_rate) {
+		LPC_SC->PCONP |= (1 << 24); //power UART2
+		LPC_SC->PCLKSEL1 &= ~(3 << 16); //reset
+		LPC_SC->PCLKSEL1 |= (1 << 16); //regular clock
+		LPC_PINCON->PINSEL4 &= ~(3 << 16);
+		LPC_PINCON->PINSEL4 &= ~(3<<18);
+		LPC_PINCON->PINSEL4 |= (2 << 16);
+		LPC_PINCON->PINSEL4 |= (2 << 18);//1010 -> initialize Tx2 and Rx2
+		//LPC_GPIO2->FIODIR &= ~(9 << 0); //set P2[9] input
+		//LPC_GPIO2->FIODIR |= (8 << 1); //set P2[8] output
+
+		uint8_t dll = sys_get_cpu_clock() / (16 * baud_rate);
+
+		LPC_UART2->LCR = (1 << 7);
+		LPC_UART2->DLM = (dll >> 8);
+		LPC_UART2->DLL = dll;
+
+		//LPC_UART2->LCR &= ~(1 << 7); //8 bit transfer
+		LPC_UART2->LCR = 3;
+		return true;
+	}
+
+	void put_char(char c) {
+		LPC_UART2->THR = c;
+		while (1) {
+			if (LPC_UART2->LSR & (1 << 5)) {
+				break;
+			}
+		}
+	}
+
+	char get_char(void) {
+		while (1) {
+			if (LPC_UART2->LSR & (1 << 0)) {
+				break;
+			}
+		}
+		char c = LPC_UART2->RBR;
+		return c;
+	}
+};
+
+class lab2_task: public scheduler_task {
+public:
+	lab2_task(uint8_t priority) :
+			scheduler_task("lab2", 2000, priority) {
+		//intentionally left empty
+	}
+	bool run(void *p) {
+		printf("Device ID: ");
+		init();
+		LPC_GPIO0 -> FIOCLR = (1 << 6);
+		spi1_ExchangeByte(0x9F);
+		printf("%x", spi1_ExchangeByte(0x00));
+		printf("%x", spi1_ExchangeByte(0x00));
+		printf("%x", spi1_ExchangeByte(0x00));
+		printf("%x", spi1_ExchangeByte(0x00));
+		printf("%x", spi1_ExchangeByte(0x00));
+		printf("\n");
+		LPC_GPIO0 -> FIOSET = (1 << 6);
+		LPC_GPIO0 -> FIOCLR = (1 << 6);
+		printf("Status Register: ");
+		spi1_ExchangeByte(0xD7);
+		printf("%x", spi1_ExchangeByte(0xFF));
+		printf("%x", spi1_ExchangeByte(0xFF));
+		LPC_GPIO0 -> FIOSET = (1 << 6);
+		printf("\n\n");
+		vTaskDelay(1000);
+		return true;
+	}
+	bool init() {
+
+
+	    LPC_SC->PCONP |= (1 << 10);     // SPI1 Power Enable
+	    LPC_SC->PCLKSEL0 &= ~(3 << 20); // Clear clock Bits
+	    LPC_SC->PCLKSEL0 |=  (1 << 20); // CLK / 1
+
+	    // Select MISO, MOSI, and SCK pin-select functionality
+	    LPC_PINCON->PINSEL0 &= ~( (3 << 14) | (3 << 16) | (3 << 18) );
+	    LPC_PINCON->PINSEL0 |=  ( (2 << 14) | (2 << 16) | (2 << 18) );
+
+	    LPC_SSP1->CR0 = 7;          // 8-bit mode
+	    LPC_SSP1->CR1 = (1 << 1);   // Enable SSP as Master
+	    LPC_SSP1->CPSR = 8;         // SCK speed = CPU / 8
+	    LPC_GPIO0 -> FIODIR |= (1 << 6);
+		return true;
+
+	}
+	char spi1_ExchangeByte(char out)
+	{
+	    LPC_SSP1->DR = out;
+	    while(LPC_SSP1->SR & (1 << 4)); // Wait until SSP is busy
+	    return LPC_SSP1->DR;
+	}
+};
+
+class gpio_task: public scheduler_task {
+public:
+	gpio_task(uint8_t priority) :
+			scheduler_task("gpio", 2000, priority) {
+
+	}
+	bool run(void *p) {
+		LPC_GPIO1->FIOPIN |= (1 << 0);
+		vTaskDelay(200);
+		LPC_GPIO1->FIOPIN &= ~(1 << 0);
+		vTaskDelay(200);
+		while (1) {
+			if (LPC_GPIO2->FIOPIN & (1 << 0)) {
+				LPC_GPIO2->FIOSET = (1 << 1);
+				if (LPC_GPIO1->FIOPIN & (1 << 15)) {
+					LPC_GPIO1->FIOCLR = (1 << 8);
+				} else {
+					LPC_GPIO1->FIOSET = (1 << 8);
+				}
+			} else {
+				LPC_GPIO2->FIOCLR = (1 << 1);
+				if (LPC_GPIO1->FIOPIN & (1 << 15)) {
+					LPC_GPIO1->FIOCLR = (1 << 8);
+				} else {
+					LPC_GPIO1->FIOSET = (1 << 8);
+				}
+			}
+		}
+		vTaskDelay(1000);
+		return true;
+	}
+	bool init(void) {
+		LPC_PINCON->PINSEL2 &= ~(3 << 0);
+		LPC_PINCON->PINSEL2 &= ~(0 << 0); //configure P2[0]
+		LPC_PINCON->PINSEL2 &= ~(1 << 0); //configure P2[1]
+		LPC_PINCON->PINSEL1 &= ~(8 << 0); //configure P1[8]
+		LPC_PINCON->PINSEL1 &= ~(15 << 0); //configure P1[15]
+		LPC_GPIO1->FIODIR |= (1 << 0);
+		LPC_GPIO2->FIODIR &= ~(1 << 0); //set P2[0] input
+		LPC_GPIO2->FIODIR |= (1 << 1); //set P2[1] output
+		LPC_GPIO1->FIODIR &= ~(15 << 1); //set P1[15] as input
+		LPC_GPIO1->FIODIR |= (8 << 1); //set P1[8] as output
+		printf("init GPIO");
+		return true;
+	}
+};
+
+
+File I/O
+You can read or write files on the SPI Flash or an SD card. You can open a limited amount of files using standard C libraries. First, at your sys_config.h file, please enable ENABLE_C_FILE_IO
+#include "io.hpp"
+ 
+void file_io()
+{
+    /* Option 1 : C library I/O (less efficient) 
+     * 0: is for SPI Flash
+     * 1: is for SD Card
+     */
+    FILE *fd = fopen("0:myfile.txt", "r");
+    char line[128] = { 0 };
+    if (fd) {
+        fgets(line, sizeof(line)-1, fd);
+        fclose(fd);
+    }
+ 
+ 
+    /* Option 2 : Use "storage" object (more efficient)
+     * This option doesn't require 'ENABLE_C_FILE_IO'
+     */
+ 
+    / Write "hello" to "myfile.txt" /
+    Storage::write("0:myfile.txt", "hello", 5, 0))
+ 
+    /* Read the size of data array from myfile.txt
+     * Not using 0: or 1: will default to 0: (SPI Flash)
+     */
+    char data[16] = { 0 };
+    Storage::read("myfile.txt", data, sizeof(data)-1, 0));
+ 
+    /* Option 3 : Directly use ff.h API that will
+     * read/write SD card or SPI Flash
+     * Read documentation at : http://elm-chan.org/fsw/ff/00index_e.html
+     */
+}
+
+class clock : public scheduler_task //task 1
+{
+    public:
+        clock(uint8_t priority) : scheduler_task("clock", 2048, priority)
+        {
+        }
+
+        bool run(void *p){
+        	int hour = 0;
+        	int minute = 0;
+        	int second = 0;
+        	if (minute%60==0){
+        		hour = hour + 1;
+        	}
+        	if (second%60==0){
+        		minute = minute + 0;
+        	}
+        	if (hour <= 9){
+        		printf("0%i:", hour%24);
+        	}
+        	else if (hour >9){
+        		printf("%i:", hour%24);
+        	}
+        	if (minute <=9){
+        		printf("0%i:", minute%60);
+        	}
+        	else if (minute >9){
+        		printf("%i:", minute%60);
+        	}
+        	if (second <=9){
+        		printf("0%i:", second%60);
+        	}
+        	else if (second >9){
+        		printf("%i:", second%60);
+        	}
+            vTaskDelay(1000); //used 100ms for testing since 1ms is too fast for Hercules to close
+            return true;
+        }
+};
+
+	//task_watchdog = xEventGroupCreate();
+   // scheduler_add_task(new terminalTask(PRIORITY_HIGH));
+   // scheduler_add_task(new IR_task(PRIORITY_MEDIUM));
+    //scheduler_add_task(new consumer_task(PRIORITY_MEDIUM));
+    //scheduler_add_task(new watchdog_task(PRIORITY_HIGH));
+
+    //scheduler_add_task(new orient_compute(PRIORITY_LOW));
+    //scheduler_add_task(new orient_process(PRIORITY_MEDIUM));
+   // qh = xQueueCreate(1, sizeof(int));
+   // xTaskCreate(rx, "rx", 1024, NULL, PRIORITY_LOW, NULL);
+   // xTaskCreate(tx, "tx", 1024, NULL, PRIORITY_MEDIUM, NULL);
+
+
+class producer_task : public scheduler_task //task 1
+{
+    public:
+        producer_task(uint8_t priority) : scheduler_task("producer", 2048, priority)
+        {
+            QueueHandle_t my_queue = xQueueCreate(1, sizeof(int));
+            addSharedObject(shared_SensorQueueId, my_queue);
+        }
+
+        bool run(void *p){
+        	int s, average;
+        	s = LS.getRawValue();
+        	i = i + 1;
+        	//xQueueSend(getSharedObject(shared_SensorQueueId), &i, 1000);
+        	xQueueSend(getSharedObject(shared_SensorQueueId), &s, 1000);
+        	total = total + s;
+        	if (i > 99){
+        		average = total/100;
+        		printf("Sending Average...\n");
+        		xQueueSend(getSharedObject(shared_SensorQueueId), &average, 1000);
+        		total = 0;
+        		i = 0;
+        		xEventGroupSetBits(task_watchdog,producer_id);
+        	}
+            vTaskDelay(100); //used 100ms for testing since 1ms is too fast for Hercules to close
+            return true;
+        }
+};
+
+class consumer_task: public scheduler_task //task 2
+{
+public:
+	consumer_task(uint8_t priority) :
+			scheduler_task("consumer", 2048, priority) {
+
+	}
+	bool run(void *p) {
+		QueueHandle_t qid = getSharedObject(shared_SensorQueueId);
+		char tofile[11] = "         \n";
+		int s, average;
+		//xQueueReceive(qid, &i, 1000);
+		xQueueReceive(qid, &s, 1000);
+		//printf("%i, %i\n", i, s);
+		sprintf(tofile, "%i, %i", i, s);
+		printf("%s\n", tofile);
+		Storage::append("1:sensor.txt", tofile, sizeof(tofile) - 1, 0);
+		if (i == 99) {
+			sprintf(tofile, "          \n"); //to clear tofile
+			//printf("Average Calculation\n");
+			xQueueReceive(qid, &average, 1000);
+			//printf("Average is %i\n", average);
+			sprintf(tofile, "Avg.  %i ", average);
+			Storage::append("1:sensor.txt", tofile, sizeof(tofile) - 1, 0);
+			xEventGroupSetBits(task_watchdog,consumer_id);
+		}
+			return true;
+		}
+	};
+
+class watchdog_task: public scheduler_task {
+public:
+	watchdog_task(uint8_t priority) :
+			scheduler_task("watchdog", 2048, priority) {
+	}
+
+	bool run(void *p) {
+		uint32_t result = xEventGroupWaitBits(task_watchdog, tasks_all_bits,
+		pdTRUE,
+		pdTRUE, 1000);
+
+		char buffer[30] = "                            \n";
+		if (result && tasks_all_bits == tasks_all_bits) {
+			puts("Both bits are set");
+		}
+
+		else if (!(result && producer_id)) {
+			puts("Producer bit is not set");
+			sprintf(buffer, "Producer bit is not set");
+			Storage::append("1:stuck.txt", buffer, sizeof(buffer)-1, 0);
+			//buffer = "Producer bit is not set";
+			//Storage::append("1:stuck.txt", buffer, 100, 0);
+			/*
+			 * append a file "stuck.txt" with the info about which task may be stuck
+			 */
+		} else if (!(result && consumer_id)) {
+			puts("Consumer bit is not set");
+			sprintf(buffer, "Consumer bit is not set");
+			Storage::append("1:stuck.txt", buffer, sizeof(buffer)-1, 0); //Close happens in the append function
+		}
+		return true;
+	}
+};
+
+class IR_task : public scheduler_task //task 1
+{
+    public:
+        IR_task(uint8_t priority) : scheduler_task("IR", 2048, priority)
+        {        }
+
+        bool run(void *p){
+        	int s;
+        	s = IS.getLastIRCode();
+        	printf("IR Value is %i\n", s);
+            vTaskDelay(1000); //used 100ms for testing since 1ms is too fast for Hercules to close
+            return true;
+        }
+};
+
+/*void rx(void *p)
+{
+    int item = 0;
+
+    puts("rx task");
+    if (xQueueReceive(qh, &item, portMAX_DELAY))
+    {
+        puts("Rx received an item!");
+    }
+
+    vTaskSuspend(0);
+    puts("Rx is suspended!");
+}
+
+void tx(void *p)
+{
+    int item = 0;
+    while(1)
+    {
+        puts("Yield");
+        taskYIELD();
+
+        xQueueSend(qh, &item, 0);
+        puts("Did I send an item?");
+
+        xQueueSend(qh, &item, 0);
+        puts("I must have sent an item");
+    }
+}*/
+
+class countdown: public scheduler_task {
+public:
+	countdown(uint8_t priority) :
+			scheduler_task("countdown", 2000, priority) {
+
+	}
+	bool run(void *p) {
+		while(1){
+		QueueHandle_t qid = getSharedObject(shared_TimerQueueId);
+		int count;
+		xQueueReceive(qid, &count, 0);
+		while (count >= 0){
+			if (count > 60){
+				LD.setNumber((count/60) - 1);
+			}
+
+			if (count <= 60){
+				LD.setNumber(count);
+			}
+			if (count % 60 >= 48){
+				LPC_GPIO1->FIOSET=(1<<0);
+				LPC_GPIO1->FIOSET=(1<<1);
+				LPC_GPIO1->FIOSET=(1<<4);
+				LPC_GPIO1->FIOSET=(1<<8);
+			}
+			else if (count % 60 >= 36 && count % 60 < 48){
+				LPC_GPIO1->FIOCLR=(1<<0);
+				LPC_GPIO1->FIOSET=(1<<1);
+				LPC_GPIO1->FIOSET=(1<<4);
+				LPC_GPIO1->FIOSET=(1<<8);
+			}
+			else if (count % 60 >= 24 && count % 60 < 36){
+				LPC_GPIO1->FIOCLR=(1<<0);
+				LPC_GPIO1->FIOCLR=(1<<1);
+				LPC_GPIO1->FIOSET=(1<<4);
+				LPC_GPIO1->FIOSET=(1<<8);
+			}
+			else if (count % 60 >= 12 && count % 60 < 24){
+				LPC_GPIO1->FIOCLR=(1<<0);
+				LPC_GPIO1->FIOCLR=(1<<1);
+				LPC_GPIO1->FIOCLR=(1<<4);
+				LPC_GPIO1->FIOSET=(1<<8);
+			}
+			else if (count % 60 < 12){
+				LPC_GPIO1->FIOCLR=(1<<0);
+				LPC_GPIO1->FIOCLR=(1<<1);
+				LPC_GPIO1->FIOCLR=(1<<4);
+				LPC_GPIO1->FIOCLR=(1<<8);
+			}
+			count = count - 1;
+			vTaskDelay(1000);
+		}
+		}
+	}
+	bool init(void) {
+		/*LPC_PINCON -> PINSEL2 &= ~(0 << 0); // set P1.0 as GPIO, LED0
+		LPC_PINCON -> PINSEL2 &= ~(2 << 0); // set P1.1 as GPIO, LED1
+		LPC_PINCON -> PINSEL2 &= ~(8 << 0); // set P1.4 as GPIO, LED2
+		LPC_PINCON -> PINSEL2 &= ~(16 << 0); //set P1.8 as GPIO, LED3
+		LPC_GPIO2->FIODIR |= (0 << 1);
+		LPC_GPIO2->FIODIR |= (1 << 1);
+		LPC_GPIO2->FIODIR |= (4 << 1);
+		LPC_GPIO2->FIODIR |= (8 << 1);*/
+		return true;
+	}
+};
